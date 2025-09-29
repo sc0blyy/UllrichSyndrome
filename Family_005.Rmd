@@ -1,0 +1,208 @@
+---
+title: "borrador3"
+author: "Paola Albarrán Godoy"
+date: "2025-09-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Primer Filtrado de Calidad
+
+El primer paso del pipeline consiste en un Filtro de Calidad (QC) con el objetivo de eliminar las variantes que probablemente representan artefactos técnicos o errores del proceso de secuenciación, asegurando que solo las variantes de alta confianza pasen.
+
+Se compone de tres criterios:
+
+1.FILTER: Se conservan las variantes con estatus PASS, que indica la máxima confianza, así como las variantes con la bandera VQSRTrancheSNP99.00to99.90. Esta última fue incluida de manera justificada para "rescatar" variantes de confianza estadística media-alta en genes de fuerte sospecha clínica que de otro modo serían descartadas.
+
+2. Calidad de la Variante (QUAL): Se establece un umbral mínimo de QUAL >= 30 para asegurar la confianza en que la variante detectada es real.
+
+3. Calidad del Genotipo (GQ): Se fija un umbral de GQ >= 20 para garantizar la fiabilidad de la asignación de genotipo (homocigoto o heterocigoto).
+
+```{r}
+rm(list = ls())
+
+
+# Librerías que ocupé
+library(readr)
+library(dplyr)
+
+data <- read_csv("/home/pgodoy/Documents/GenomicaHumana/GenmicaHumana/FAM5.csv")
+
+# Paso 1: Filtro de Calidad (QC) con solo 3 criterios, tomando como referencia los parámetros vistos en clase 
+
+data_qc <- data %>%
+  # 1. FILTER == "PASS" y "VQSRTrancheSNP99.00to99.90"
+  filter(FILTER == "PASS" | FILTER == "VQSRTrancheSNP99.00to99.90") %>%
+  
+  # 2. QUAL >= 30
+  filter(QUAL >= 30) %>%
+  
+  # 3. GQ >= 20
+  filter(GQ >= 20)
+
+# Observo si realmente hubo un cambio con el primer filtrado 
+print(paste("Variantes iniciales:", nrow(data)))
+print(paste("Variantes después de QC:", nrow(data_qc)))
+
+# Guardar resultados
+write.csv(data_qc, "variantes_post_QC_simple.csv", row.names = FALSE)
+
+```
+
+
+# Filtro por Impacto Funcional 
+
+Una vez asegurada la calidad técnica de las variantes en el paso anterior, este filtro se enfoca en la relevancia biológica. El cual tuvo como objetivo es seleccionar un subconjunto de variantes que realmente tengan un impacto en la estructura y función de la proteína.Se seleccionaron variantes de tipo:
+
+- nonsynonymous / missense: Cambian un aminoácido por otro.
+
+- stopgain: Introducen o eliminan un codón de parada prematuro.
+
+- frameshift: Alteran el marco de lectura.
+
+- splicing: Afectan el correcto procesamiento del ARN mensajero.
+
+```{r}
+
+# Leer el archivo ya filtrado por calidad, que vienen del primer filtrado
+data_qc <- read.csv("variantes_post_QC_simple.csv")
+
+
+# Filtro por efecto en la proteína
+data_effect <- data_qc %>%
+  filter(grepl("nonsynonymous|missense|stopgain|stoploss|frameshift|splicing", 
+               ANNOTATION, ignore.case = TRUE))
+
+# Observamos si hubo una reducción en la cantidad de variantes
+print(paste("Variantes después de QC:", nrow(data_qc)))
+print(paste("Variantes después de excluir sinónimas:", nrow(data_effect)))
+table(data_effect$ANNOTATION)
+
+# Guardar resultados
+write.csv(data_effect, "variantes_post_effect.csv", row.names = FALSE)
+```
+
+
+# Tercer Filtrado por Frecuencia Poblacional
+
+Dado que las enfermedades genéticas raras son causadas por variantes genéticas igualmente raras, pues el objetivo es eliminar los polimorfismos comunes, que son variaciones benignas presentes en un porcentaje significativo de la población general, para enfocar el análisis exclusivamente en los candidatos más prometedores.
+
+Se aplicó un umbral de Frecuencia Alélica Menor (MAF) del 1% (≤ 0.01), estándar en el análisis de enfermedades mendelianas, es decir, se conserva una variante solo si su frecuencia es menor o igual al 1% en las bases de datos poblacionales consultadas (ej. TGP_FREQ, ESP_FREQ). Adicionalmente, se conservan las variantes sin una frecuencia reportada (NA), ya que esto podría implicar que son extremadamente raras.
+
+```{r}
+
+data_effect <- read.csv("variantes_post_effect.csv")
+
+# Paso 3: Filtro por frecuencia poblacional (MAF ≤ 1%)
+data_freq <- data_effect %>%
+  # Convertir frecuencias a numérico 
+  mutate(
+    TGP_FREQ = as.numeric(TGP_FREQ),
+    ESP_FREQ = as.numeric(ESP_FREQ),
+    EVE_ALT_FREQ = as.numeric(EVE_ALT_FREQ)
+  ) %>%
+  # Filtrar: MAF ≤ 1% o NA (no reportada en bases de datos)
+  filter(
+    (is.na(TGP_FREQ) | TGP_FREQ <= 0.01) &
+    (is.na(ESP_FREQ) | ESP_FREQ <= 0.01) &
+    (is.na(EVE_ALT_FREQ) | EVE_ALT_FREQ <= 0.01)
+  )
+
+# Mostrar reducción
+print(paste("Variantes después de efecto:", nrow(data_effect)))
+print(paste("Variantes después de frecuencia:", nrow(data_freq)))
+
+# Guardar resultados
+write.csv(data_freq, "variantes_post_freq.csv", row.names = FALSE)
+
+# Observamos la posible variante candidata a la enfermedad
+buscar <- read.csv("variantes_post_freq.csv")
+filas_colageno2 <- buscar %>%
+  filter(grepl("COL6A1", GENE_NAME))
+
+# Imprimir la(s) variante(s) candidata(s) que encontramos
+print(filas_colageno2)
+```
+
+
+# Cuarto Filtrado por Predicción de Patogenicidad
+
+Priorizando la lista de candidatos que han pasado los filtros anteriores, se seleccionan aquellos con la mayor evidencia in-silico de ser patogénicos.
+
+Para ello, se evaluaron las predicciones de múltiples herramientas:
+
+- SIFT y PolyPhen-2 (PPH2): que predicen el impacto de un cambio de aminoácido en la función de la proteína.
+
+- LRT (Likelihood Ratio Test): otra herramienta de predicción funcional.
+
+- PhyloP: que mide el grado de conservación evolutiva de una posición, donde una alta conservación sugiere importancia funcional.
+
+Se implementó un filtro inclusivo, en donde conservaba cualquier variante que fuera predicha como dañina por al menos una de estas herramientas (ej. "Deleterious", "Damaging" o "Conserved"). Adicionalmente, se mantuvieron las variantes para las cuales no había una predicción disponible (. o NA) para no descartar prematuramente posibles candidatos.
+
+
+```{r}
+variants_maf <- read_csv("variantes_post_freq.csv")
+nrow(variants_maf)
+
+variants_pred <- variants_maf %>%
+  filter(
+    # SIFT: deleterious o sin dato
+    (SIFT_PRED %in% c("D") | SIFT_PRED %in% c(".", NA)) |
+    # PolyPhen: dañina/posible o sin dato
+    (PPH2_PRED %in% c("D", "P") | PPH2_PRED %in% c(".", NA)) |
+    # LRT: deleterious o sin dato
+    (LRT_PRED == "D" | LRT_PRED %in% c(".", NA)) |
+    # PhyloP: conservada o sin dato
+    (PHYLOP_PRED == "C" | PHYLOP_PRED %in% c(".", NA))
+  )
+
+write_csv(variants_pred, "FAM5_pred_filtered.csv")
+
+
+# Observamos la posible variante candidata a la enfermedad
+buscar2 <- read.csv("FAM5_pred_filtered.csv")
+nrow(buscar2)
+filas_colageno3 <- buscar2 %>%
+  filter(grepl("COL6A1", GENE_NAME))
+
+# Imprimir la(s) variante(s) candidata(s) que encontramos
+print(filas_colageno3)
+
+```
+
+
+#  Análisis de Trio y Selección del Candidato Final
+
+Por último, se integró la información genotípica de la familia para identificar la variante causal. El objetivo es indagar en la lista de candidatos de alta confianza para encontrar aquellos que se segreguen en la familia según un patrón de herencia compatible con el fenotipo.
+
+Como primer pasó, se evaluó modelos de herencia estándar (ej. autosómico recesivo, dominante, de novo). Sin embargo, estos modelos no arrojaron un candidato concluyente. En su lugar, el pipeline identificó una única variante de alto interés en el gen COL6A1 cuyos datos de herencia eran incompletos, por lo tanto, se realizó una búsqueda específica y dirigida para aislar esta variante, utilizando como criterio un genotipo heterocigoto (het) en la paciente y genotipos no determinados (na) en ambos padres, que correspondía al perfil exacto del candidato observado, la falta de datos impide la confirmación formal de un patrón de herencia.
+
+
+```{r}
+variants_final <- read.csv("FAM5_pred_filtered.csv")
+
+# Busqueda de la variante
+candidato_final_definitivo <- variants_final %>%
+  filter(
+    grepl("COL6A1", GENE_NAME),        # Que esté en el gen de interés
+    Proband.ZYG == "Proband:het",      # La paciente es het
+    Father.ZYG == "Father:na",         # El cambio clave: buscamos el texto "Father:na"
+    Mother.ZYG == "Mother:na"          # El cambio clave: buscamos el texto "Mother:na"
+  )
+
+# Mostramos el resultado final
+if (nrow(candidato_final_definitivo) > 0) {
+  cat("--- SE ENCONTRÓ EL CANDIDATO FINAL ---\n\n")
+  print(
+    candidato_final_definitivo %>%
+      select(GENE_NAME, ANNOTATION, Proband.ZYG, Father.ZYG, Mother.ZYG, SIFT_PRED, PPH2_PRED)
+  )
+} else {
+  cat("No se encontró la variante")
+}
+
+```
+
